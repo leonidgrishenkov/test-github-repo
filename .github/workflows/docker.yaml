@@ -16,7 +16,7 @@ permissions:
 
 jobs:
   docker:
-    uses: leonidgrishenkov/github-actions/.github/workflows/docker.yaml@feat/docker-workflow
+    uses: leonidgrishenkov/github-actions/.github/workflows/docker.yaml@main
     with:
       image-name: hello-docker
       # smoke-test proves the binary runs in the final scratch image.

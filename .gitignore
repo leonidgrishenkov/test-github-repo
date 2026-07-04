@@ -1,0 +1,16 @@
+# Build artifacts
+/out/
+/dist/
+
+# Go
+*.test
+*.out
+go.work.sum
+
+# Local env / editor
+.env
+.env.*
+.DS_Store
+*.swp
+.idea/
+.vscode/

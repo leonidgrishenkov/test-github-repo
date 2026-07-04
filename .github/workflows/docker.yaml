@@ -1,0 +1,26 @@
+# Calls the shared reusable docker workflow in leonidgrishenkov/github-actions.
+#
+# Builds, scans, and pushes the hello-docker image to Yandex Container Registry.
+name: Release Docker Image
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    # push: false isn't an option anymore; PRs run lint+scan only via the gate below.
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  docker:
+    uses: leonidgrishenkov/github-actions/.github/workflows/docker.yaml@main
+    with:
+      image-name: hello-docker
+      # smoke-test proves the binary runs in the final scratch image.
+      smoke-test-args: "--version"
+      # labels carry the released version into the binary via -ldflags.
+      # All other inputs (registry, platforms, provenance, sbom) use workflow defaults.
+    secrets: inherit    # forwards YC_CR_SA_AUTH_JSON; reads vars.YC_REGISTRY_ID

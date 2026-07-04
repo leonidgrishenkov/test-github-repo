@@ -8,19 +8,25 @@ on:
     branches: [main]
     tags: ['v*']
   pull_request:
-    # push: false isn't an option anymore; PRs run lint+scan only via the gate below.
+    # Reusable workflow always pushes (push: true is hardcoded in it).
+    # PRs therefore build, scan, AND push — fine for a throwaway test repo.
     branches: [main]
 
-permissions:
-  contents: read
+# Required caller permissions: the reusable workflow's jobs may only use a
+# *subset* of what the caller grants (permissions can't be elevated across
+# the reusable-workflow boundary). Grant the union here; the called workflow
+# narrows per job (lint -> read; scan -> read+security-events; push -> read+id-token).
 
 jobs:
   docker:
+    permissions:
+      contents: read        # checkout
+      security-events: write # Trivy SARIF -> Code Scanning (scan job)
+      id-token: write        # cosign keyless OIDC (push job)
     uses: leonidgrishenkov/github-actions/.github/workflows/docker.yaml@main
     with:
       image-name: hello-docker
       # smoke-test proves the binary runs in the final scratch image.
       smoke-test-args: "--version"
-      # labels carry the released version into the binary via -ldflags.
       # All other inputs (registry, platforms, provenance, sbom) use workflow defaults.
     secrets: inherit    # forwards YC_CR_SA_AUTH_JSON; reads vars.YC_REGISTRY_ID

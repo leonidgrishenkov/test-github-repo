@@ -4,7 +4,7 @@
 # for the build stage), then ships a scratch-based final image.
 
 # syntax=docker/dockerfile:1.7
-ARG GO_VERSION=1.27
+ARG GO_VERSION=1.26.4
 
 FROM --platform=${BUILDPLATFORM} golang:${GO_VERSION} AS build
 ARG TARGETARCH

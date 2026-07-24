@@ -10,7 +10,7 @@ jobs:
       contents: read        # checkout
       security-events: write # Trivy SARIF -> Code Scanning (scan job)
       id-token: write        # cosign keyless OIDC (push job)
-    uses: .github/workflows/docker.yml@main
+    uses: ./.github/workflows/docker.yml
     with:
       image-name: test-github-repo
       registry-repo: github/tests

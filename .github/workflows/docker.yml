@@ -1,0 +1,382 @@
+# Reusable Docker build/release workflow for Yandex Container Registry.
+#
+# Jobs:
+#   lint  (hadolint)
+#     └─ scan  (build amd64, Trivy, smoke test)        — gate; nothing is pushed
+#          └─ push (build multi-arch, push, SBOM + SLSA provenance, cosign sign)
+#
+# Why split scan and push into separate jobs?
+#   • A scan failure can never trigger a push (push `needs: scan` and runs only on success).
+#   • Each job carries least-privilege permissions (scan gets security-events:write
+#     for SARIF; push gets id-token:write for cosign — neither has the other's power).
+#   • In the Actions UI you immediately see which phase failed instead of digging
+#     through one job's steps.
+#   • Re-running just `push` (e.g. after a transient registry error) doesn't redo
+#     the scan, since BuildKit layers come from the shared GHA cache.
+#
+# Hardcoded in this file (not exposed as inputs):
+#   REGISTRY     = cr.yandex
+#   REGISTRY_ID  = ${{ vars.YC_REGISTRY_ID }}    (GitHub variable)
+#   PLATFORMS    = linux/amd64,linux/arm64
+#
+# Push is opt-out via the `push` input (default true). Set `push: false` to stop
+# after lint + scan — the gate runs, nothing is pushed. Useful for testing the
+# pipeline without side effects.
+#
+# Usage from another repo:
+#
+#   jobs:
+#     docker:
+#       permissions:
+#         contents: read         # checkout
+#         security-events: write # Trivy SARIF -> Code Scanning (scan job)
+#         id-token: write        # cosign keyless OIDC (push job)
+#       uses: <org>/github-actions/.github/workflows/docker.yaml@main
+#       with:
+#         image-name: myapp
+#         # optional: dockerfile, context, scan-severity,
+#         #           smoke-test-args, provenance, sbom, registry-repo, push
+#       secrets: inherit    # REQUIRED — forwards YC_CR_SA_AUTH_JSON (no explicit secret declared)
+#
+# WHY the caller must grant permissions:
+#   Reusable workflows can only *maintain or reduce* permissions, never elevate
+#   them. The called jobs request `security-events: write` (scan) and
+#   `id-token: write` (push), so the caller must grant both — otherwise GitHub
+#   rejects the workflow as invalid ("only allowed '...: none'").
+#
+# Required caller repo variable + secret:
+#   vars.YC_REGISTRY_ID        - Yandex Container Registry id
+#   secrets.YC_CR_SA_AUTH_JSON - YC service account JSON key (used as `json_key` password)
+#
+# Note on `secrets: inherit`: this workflow does NOT declare a `secrets:` block, so the
+# caller MUST pass `secrets: inherit`. Without it, YC_CR_SA_AUTH_JSON is empty and login fails.
+#
+# The full image reference is built as:
+#   cr.yandex/<YC_REGISTRY_ID>/<registry-repo|caller-repo>/<image-name>
+# mirroring the existing cr.yandex/<id>/<repo>/<image> convention.
+name: Build & Push Docker Image (YC CR)
+
+on:
+  workflow_call:
+    inputs:
+      image-name:
+        description: Image name within the registry (last path segment).
+        required: true
+        type: string
+      dockerfile:
+        description: Path to the Dockerfile, relative to context.
+        required: false
+        default: ./Dockerfile
+        type: string
+      context:
+        description: Build context path.
+        required: false
+        default: .
+        type: string
+      scan-severity:
+        description: Trivy severity levels that fail the build.
+        required: false
+        default: HIGH,CRITICAL
+        type: string
+      smoke-test-args:
+        description: >-
+          Args appended to `docker run` against the built amd64 image. Empty = skip.
+          May be a full command (e.g. "fish --version") or, for images with a CMD
+          but no ENTRYPOINT, bare flags (e.g. "--version") which are auto-prepended
+          with CMD[0]. Images WITH an ENTRYPOINT receive the args appended to it.
+        required: false
+        default: ''
+        type: string
+      provenance:
+        description: SLSA provenance mode (mode=max | mode=min | false).
+        required: false
+        default: mode=max
+        type: string
+      sbom:
+        description: Attach an SBOM attestation (true/false).
+        required: false
+        default: 'true'
+        type: string
+      registry-repo:
+        description: Repository segment between registry id and image name. Empty = caller repo name.
+        required: false
+        default: ''
+        type: string
+      push:
+        description: >-
+          Run the push job (multi-arch build, registry push, SBOM + SLSA provenance,
+          cosign sign). When false, the workflow stops after lint + scan (the gate)
+          — useful for testing the pipeline without pushing. Default true (release).
+        required: false
+        default: 'true'
+        type: string
+
+permissions:
+  contents: read   # least-privilege default; expanded per job below
+
+env:
+  REGISTRY: cr.yandex
+  REGISTRY_ID: ${{ vars.YC_REGISTRY_ID }}
+  PLATFORMS: linux/amd64,linux/arm64
+
+concurrency:
+  group: ${{ inputs.image-name }}-${{ github.ref }}
+  cancel-in-progress: false   # never cancel a multi-arch push mid-flight
+
+jobs:
+  lint:
+    name: Lint Dockerfile
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Run hadolint
+        uses: hadolint/hadolint-action@v3.3.0
+        with:
+          dockerfile: ${{ inputs.dockerfile }}
+
+  scan:
+    name: Build & scan (amd64)
+    needs: lint
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write   # upload Trivy SARIF to Code Scanning
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Prepare image reference
+        env:
+          REPO_IN: ${{ inputs.registry-repo }}
+          REPO_DEFAULT: ${{ github.event.repository.name }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          REPO="${REPO_IN:-$REPO_DEFAULT}"
+          FULL="${REGISTRY}/${REGISTRY_ID}/${REPO}/${IMAGE_NAME}"
+          echo "FULL_IMAGE=${FULL}" >> "$GITHUB_ENV"
+          echo "::notice::Scanning ${FULL}:${{ github.sha }}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Login is needed when the Dockerfile pulls a base image from the same YC registry.
+      - name: Log in to Yandex Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: json_key
+          password: ${{ secrets.YC_CR_SA_AUTH_JSON }}
+
+      # Build a single-arch image into the daemon so it can be scanned & smoke-tested.
+      # (Multi-arch cannot be loaded locally, hence the amd64-only scan image.)
+      - name: Build (amd64, load for scan)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: linux/amd64
+          load: true
+          tags: ${{ env.FULL_IMAGE }}:${{ github.sha }}
+          cache-from: type=gha,key=${{ inputs.image-name }}
+          cache-to: type=gha,mode=max,key=${{ inputs.image-name }}
+          provenance: false
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@v0.36.0   # v-prefixed tag (post-2025 supply-chain migration)
+        with:
+          image-ref: ${{ env.FULL_IMAGE }}:${{ github.sha }}
+          severity: ${{ inputs.scan-severity }}
+          ignore-unfixed: true
+          exit-code: '1'
+          format: sarif
+          output: trivy-results.sarif
+
+      # Print the findings as a readable table in the job log so scan failures
+      # are debuggable without leaving the Actions UI. Runs even when the scan
+      # step failed (exit-code: 1) so the CVEs that tripped the gate are visible.
+      - name: Print Trivy findings
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -f trivy-results.sarif ]; then echo "No SARIF file produced."; exit 0; fi
+          python3 - <<'PY'
+          import json,re,sys
+          from collections import defaultdict
+          try:
+              d=json.load(open('trivy-results.sarif'))
+          except Exception as e:
+              print("Could not parse SARIF:",e); sys.exit(0)
+          sev_filter={"HIGH","CRITICAL"}
+          g=defaultdict(list)
+          for run in d.get('runs',[]):
+              for r in run.get('results',[]):
+                  t=r.get('message',{}).get('text','')
+                  pkg=re.search(r'Package:\s*(\S+)',t)
+                  inst=re.search(r'Installed Version:\s*(\S+)',t)
+                  sev=re.search(r'Severity:\s*(\S+)',t)
+                  fix=re.search(r'Fixed Version:\s*(.+)',t)
+                  cve=r.get('ruleId','')
+                  s=sev.group(1) if sev else ''
+                  if s not in sev_filter or not fix: continue
+                  g[(pkg.group(1) if pkg else '?', inst.group(1) if inst else '?')].append((s,fix.group(1).strip(),cve))
+          if not g:
+              print("No fixable HIGH/CRITICAL vulnerabilities found.")
+          else:
+              print("=== Fixable HIGH/CRITICAL findings (fail the gate) ===")
+              print()
+              for (pkg,inst),items in sorted(g.items()):
+                  cves=', '.join(sorted({c for _,_,c in items}))
+                  fixes='; '.join(sorted({f for _,f,_ in items}))
+                  print(f"{pkg} {inst}  [{','.join(sorted({s for s,_,_ in items}))}]")
+                  print(f"  CVEs: {cves}")
+                  print(f"  Fix to: {fixes}")
+                  print()
+          PY
+
+      - name: Upload Trivy SARIF
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-results.sarif
+
+      # Smoke test: run `docker run --rm <image> <smoke-test-args>`.
+      # If smoke-test-args begins with a flag (e.g. "--version"), `docker run <img> --version`
+      # would REPLACE the image CMD and try to exec the flag as a binary (OCI error:
+      # `exec: "--version": executable file not found`). For images that have no
+      # ENTRYPOINT but do have a CMD (typical for dev containers whose CMD is a shell),
+      # we prepend CMD[0] so `--version` becomes `<cmd0> --version`. Images WITH an
+      # ENTRYPOINT already receive args appended to it, so we leave those untouched.
+      # Pass a full command (e.g. "fish --version") to bypass the heuristic entirely.
+      - name: Smoke test
+        if: ${{ inputs.smoke-test-args != '' }}
+        run: |
+          IMG="${{ env.FULL_IMAGE }}:${{ github.sha }}"
+          ARGS="${{ inputs.smoke-test-args }}"
+          case "$ARGS" in
+            -*)
+              EP_LEN=$(docker inspect -f '{{len .Config.Entrypoint}}' "$IMG")
+              if [ "$EP_LEN" = "0" ]; then
+                CMD0=$(docker inspect -f '{{if .Config.Cmd}}{{index .Config.Cmd 0}}{{end}}' "$IMG")
+                if [ -z "$CMD0" ]; then
+                  echo "::error::smoke-test-args start with '-' ('$ARGS') but the image has no ENTRYPOINT/CMD to prepend. Pass a full command (e.g. 'fish --version') instead."
+                  exit 1
+                fi
+                echo "::notice::smoke-test-args start with a flag; prepending image CMD[0] ('$CMD0') -> running: $CMD0 $ARGS"
+                ARGS="$CMD0 $ARGS"
+              fi
+              ;;
+          esac
+          docker run --rm $IMG $ARGS
+
+      - name: Scan summary
+        if: always()
+        run: |
+          {
+            echo "### Scan summary"
+            echo ""
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Image | \`${{ env.FULL_IMAGE }}:${{ github.sha }}\` |"
+            echo "| Severity gate | \`${{ inputs.scan-severity }}\` |"
+            echo "| Smoke test | ${{ inputs.smoke-test-args != '' && 'ran' || 'skipped' }} |"
+            echo "| SARIF | Security › Code scanning alerts |"
+            echo "| Push | ${{ inputs.push == 'true' && '→ next job (multi-arch)' || 'skipped (push=false)' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  push:
+    name: Build & push (multi-arch) + sign
+    needs: scan
+    if: ${{ inputs.push == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # OIDC for cosign keyless signing
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Prepare image reference
+        env:
+          REPO_IN: ${{ inputs.registry-repo }}
+          REPO_DEFAULT: ${{ github.event.repository.name }}
+          IMAGE_NAME: ${{ inputs.image-name }}
+        run: |
+          REPO="${REPO_IN:-$REPO_DEFAULT}"
+          FULL="${REGISTRY}/${REGISTRY_ID}/${REPO}/${IMAGE_NAME}"
+          echo "FULL_IMAGE=${FULL}" >> "$GITHUB_ENV"
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Yandex Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: json_key
+          password: ${{ secrets.YC_CR_SA_AUTH_JSON }}
+
+      - name: Derive tags & labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.FULL_IMAGE }}
+          # Exactly two published tags: the full commit SHA (hardcoded in the
+          # build-push step below) and the git tag version (e.g. 1.4). The semver
+          # rules only match when a version tag is pushed; on a 1.4 tag both
+          # collapse to :1.4, and a 1.4.2 tag also yields the rolling :1.4.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      # Rebuild multi-arch from the GHA cache populated by `scan`, then push with
+      # SBOM + SLSA provenance attestations attached.
+      - name: Build & push (multi-arch + attestations)
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ env.PLATFORMS }}
+          push: true
+          tags: |
+            ${{ env.FULL_IMAGE }}:${{ github.sha }}
+            ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: ${{ inputs.provenance }}
+          sbom: ${{ inputs.sbom == 'true' }}
+          cache-from: type=gha,key=${{ inputs.image-name }}
+          cache-to: type=gha,mode=max,key=${{ inputs.image-name }}
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Sign image (keyless via GitHub OIDC)
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+        run: cosign sign --yes "${{ env.FULL_IMAGE }}@${{ steps.push.outputs.digest }}"
+
+      - name: Release summary
+        run: |
+          {
+            echo "### Docker release summary"
+            echo ""
+            echo "| Key | Value |"
+            echo "|---|---|"
+            echo "| Image | \`${{ env.FULL_IMAGE }}\` |"
+            echo "| Platforms | \`${{ env.PLATFORMS }}\` |"
+            echo "| Digest | \`${{ steps.push.outputs.digest }}\` |"
+            echo "| Attestations | provenance=\`${{ inputs.provenance }}\` sbom=\`${{ inputs.sbom }}\` |"
+            echo "| Signed | ✅ cosign keyless (OIDC) |"
+            echo "| Scan | Security › Code scanning alerts (Trivy SARIF) |"
+          } >> "$GITHUB_STEP_SUMMARY"

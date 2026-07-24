@@ -14,6 +14,6 @@ jobs:
     with:
       image-name: test-github-repo
       registry-repo: github/tests
-      smoke-test-args: "/hello"
+      smoke-test-args: "version"
     secrets: inherit
 

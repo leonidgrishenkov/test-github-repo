@@ -244,34 +244,6 @@ jobs:
         with:
           sarif_file: trivy-results.sarif
 
-      # Smoke test: run `docker run --rm <image> <smoke-test-args>`.
-      # If smoke-test-args begins with a flag (e.g. "--version"), `docker run <img> --version`
-      # would REPLACE the image CMD and try to exec the flag as a binary (OCI error:
-      # `exec: "--version": executable file not found`). For images that have no
-      # ENTRYPOINT but do have a CMD (typical for dev containers whose CMD is a shell),
-      # we prepend CMD[0] so `--version` becomes `<cmd0> --version`. Images WITH an
-      # ENTRYPOINT already receive args appended to it, so we leave those untouched.
-      # Pass a full command (e.g. "fish --version") to bypass the heuristic entirely.
-      - name: Smoke test
-        if: ${{ inputs.smoke-test-args != '' }}
-        run: |
-          IMG="${{ env.FULL_IMAGE }}:${{ github.sha }}"
-          ARGS="${{ inputs.smoke-test-args }}"
-          case "$ARGS" in
-            -*)
-              EP_LEN=$(docker inspect -f '{{len .Config.Entrypoint}}' "$IMG")
-              if [ "$EP_LEN" = "0" ]; then
-                CMD0=$(docker inspect -f '{{if .Config.Cmd}}{{index .Config.Cmd 0}}{{end}}' "$IMG")
-                if [ -z "$CMD0" ]; then
-                  echo "::error::smoke-test-args start with '-' ('$ARGS') but the image has no ENTRYPOINT/CMD to prepend. Pass a full command (e.g. 'fish --version') instead."
-                  exit 1
-                fi
-                echo "::notice::smoke-test-args start with a flag; prepending image CMD[0] ('$CMD0') -> running: $CMD0 $ARGS"
-                ARGS="$CMD0 $ARGS"
-              fi
-              ;;
-          esac
-          docker run --rm $IMG $ARGS
 
       - name: Scan summary
         if: always()

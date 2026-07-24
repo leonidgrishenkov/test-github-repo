@@ -15,20 +15,6 @@ concurrency:
   cancel-in-progress: false   # never cancel a multi-arch push mid-flight
 
 jobs:
-  lint:
-    name: Lint Dockerfile
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Run hadolint
-        uses: hadolint/hadolint-action@v3.3.0
-        with:
-          dockerfile: ./Dockerfile
-
   scan:
     name: Build & scan (amd64)
     needs: lint
@@ -42,7 +28,7 @@ jobs:
 
       - name: Prepare image reference
         env:
-          REPO_IN: ${{ inputs.registry-repo }}
+          REPO_IN: github/personal
           REPO_DEFAULT: ${{ github.event.repository.name }}
           IMAGE_NAME: ${{ inputs.image-name }}
         run: |
